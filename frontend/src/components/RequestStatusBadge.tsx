@@ -1,0 +1,18 @@
+import type { RequestStatus } from '../types';
+
+const STATUS_STYLES: Record<RequestStatus, string> = {
+  PENDING: 'bg-yellow-100 text-yellow-800',
+  APPROVED: 'bg-green-100 text-green-800',
+  REJECTED: 'bg-red-100 text-red-800',
+  CANCELLED: 'bg-gray-100 text-gray-600',
+};
+
+export function RequestStatusBadge({ status }: { status: RequestStatus }) {
+  return (
+    <span
+      className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${STATUS_STYLES[status]}`}
+    >
+      {status.charAt(0) + status.slice(1).toLowerCase()}
+    </span>
+  );
+}
