@@ -119,7 +119,10 @@ UNIQUE (employeeId, locationId, leaveType, year)
 ```
 time_off_requests
 ├── id              UUID PK
-├── idempotencyKey  VARCHAR(64) UNIQUE   ← SHA-256: employeeId+start+end+type
+├── idempotencyKey  VARCHAR(64) INDEX    ← SHA-256: employeeId+start+end+type
+│                                        (not UNIQUE at DB level — allows re-submit
+│                                         after REJECTED/CANCELLED; app-layer check
+│                                         blocks duplicates in PENDING/APPROVED state)
 ├── employeeId      UUID FK
 ├── locationId      VARCHAR(100)
 ├── leaveType       ENUM(...)
@@ -176,9 +179,11 @@ hcm_sync_logs
 
 | Method | Path                               | Auth          | Description                     |
 |--------|------------------------------------|---------------|---------------------------------|
-| GET    | /balances/me                       | JWT           | My current balances             |
-| GET    | /balances/:employeeId              | JWT+MANAGER   | Employee balances (manager only)|
-| POST   | /balances/sync/:employeeId         | JWT+MANAGER   | Trigger real-time HCM sync      |
+| GET    | /balances/me                       | JWT           | Fetch my balances — pulls live from HCM, refreshes local cache, returns local (includes `pendingDays` HCM doesn't track) |
+| GET    | /balances/:employeeId              | JWT+MANAGER   | Same HCM-first fetch for any employee |
+| PATCH  | /balances/:employeeId              | JWT+ADMIN     | Manual admin override (local only; triggers `balance.updated` WS event) |
+
+> `GET /balances/me` **always calls HCM first**. The local SQLite row is refreshed in-place (`totalDays = hcm.balance + usedDays`). If HCM is unreachable the cached row is returned silently and a warning is logged.
 
 ### 5.4 Time-Off Requests
 
@@ -224,17 +229,18 @@ Employee  →  API Gateway  →  time-off µsvc  →  hcm-mock
    │─────────────►│               │                │
    │              │  TCP: request.create            │
    │              │──────────────►│                │
-   │              │               │  GET /balance  │
+   │              │               │  GET /balance/:type  (HCM primary)
    │              │               │───────────────►│
    │              │               │◄───────────────│
-   │              │               │  (balance ok)  │
+   │              │               │  effectiveAvail = hcm.balance - pendingDays
+   │              │               │  (fallback: totalDays-usedDays-pendingDays
+   │              │               │   if HCM is unreachable)
    │              │               │  Create PENDING│
-   │              │               │  Lock pendingDays
+   │              │               │  pendingDays++ │
    │              │◄──────────────│                │
    │  201 Created │               │                │
    │◄─────────────│               │                │
-   │              │  WS: request.created            │
-   │◄─────────────│               │                │
+   │              │  WS: request.created → manager  │
 ```
 
 ### 6.2 Manager Approval (with HCM Validation)
@@ -308,13 +314,14 @@ CronJob / Admin  →  time-off µsvc  →  hcm-mock
 
 | Layer | Mechanism | What It Guards Against |
 |-------|-----------|------------------------|
-| 1 | Idempotency key (SHA-256) | Duplicate request submissions |
-| 2 | Local `pendingDays` check | Requests exceeding available balance locally |
-| 3 | HCM real-time pre-flight | HCM balance < local balance (stale local data) |
-| 4 | TypeORM `@VersionColumn` + transaction | Concurrent approvals of the same request |
-| 5 | HCM approval response validation | HCM returning insufficient-balance error |
-| 6 | Batch cron reconciliation | Drift between HCM and local balances |
-| 7 | Webhook listener | HCM-initiated changes (anniversaries, resets) |
+| 1 | Idempotency key (SHA-256) on active statuses | Duplicate submissions — only blocks re-submit when a PENDING or APPROVED record exists for the same key; REJECTED/CANCELLED records do not block |
+| 2 | Date-range overlap check | Overlapping PENDING/APPROVED requests for the same employee |
+| 3 | **HCM real-time balance (primary)** `hcm.balance - pendingDays` | Requests exceeding HCM-authoritative available balance; `pendingDays` subtracted because HCM has no visibility into unresolved requests |
+| 4 | Local cache fallback (HCM unreachable) | Unblocks legitimate submissions during HCM downtime using last-known cached balance |
+| 5 | TypeORM `@VersionColumn` + serializable transaction | Concurrent approvals / balance writes racing each other |
+| 6 | HCM balance check at approval time | Re-validates against HCM in the approval transaction; auto-rejects if HCM reports insufficient balance |
+| 7 | Batch reconciliation (admin / cron) | Accumulated drift; `totalDays` overwritten with HCM value, overdrawn pending requests flagged |
+| 8 | Inbound HCM webhook | HCM-initiated changes (anniversaries, year-resets, HR corrections) — cache refreshed, overdrawn pending requests flagged |
 
 ### 7.2 Optimistic Locking
 
@@ -322,17 +329,32 @@ Every write to `LeaveBalance` increments `version`. If two concurrent approval a
 
 ### 7.3 Available Balance Formula
 
+**At submission time (HCM available):**
 ```
-availableDays = totalDays - usedDays - pendingDays
+effectiveAvailable = hcm.balance - local.pendingDays
 ```
+`hcm.balance` already reflects approved deductions. We subtract `pendingDays` because HCM has no knowledge of requests awaiting manager decision.
+
+**Fallback (HCM unreachable):**
+```
+effectiveAvailable = totalDays - usedDays - pendingDays
+```
+
+**Cache reconstruction (on every balance read):**
+```
+local.totalDays = hcm.balance + local.usedDays
+```
+This keeps `totalDays` meaningful (the employee's full allocation) while letting the balance display `available = totalDays - usedDays - pendingDays` consistently.
 
 ### 7.4 HCM Mismatch Handling
 
-When batch sync detects `hcmBalance ≠ localBalance`:
-1. Log the discrepancy to `hcm_sync_logs`.
+**On every balance read (pull-on-read):**
+`totalDays` is refreshed automatically (`hcm.balance + usedDays`). Drift is self-healing — no discrepancy survives beyond one read cycle.
+
+**On inbound webhook or batch sync:**
+1. Log discrepancy to `hcm_sync_logs`.
 2. **Trust HCM** — overwrite `totalDays` with HCM value.
-3. Recalculate `availableDays`.
-4. If any PENDING request now exceeds available balance, **alert** (emit WebSocket event + log) but do not auto-cancel — require manager action.
+3. If any PENDING request now exceeds available balance, emit `balance.overdrawn-warning` to the admin room and log — do **not** auto-cancel; require manager action.
 
 ---
 
@@ -355,16 +377,17 @@ When batch sync detects `hcmBalance ≠ localBalance`:
 
 ## 9. Real-Time Events (WebSocket)
 
-All WebSocket events are room-scoped (each authenticated user joins their own `user:{id}` room and managers join `manager:{id}` room).
+Each authenticated user joins `user:{id}`. Managers also join the shared `managers` room. Admins also join the `admins` room.
 
-| Event               | Payload                                          | Recipients                     |
-|---------------------|--------------------------------------------------|--------------------------------|
-| `request.created`   | `{ requestId, employeeId, daysCount, leaveType }` | Manager of requester           |
-| `request.approved`  | `{ requestId, balance }`                         | Requesting employee            |
-| `request.rejected`  | `{ requestId, managerNote }`                     | Requesting employee            |
-| `request.cancelled` | `{ requestId }`                                  | Manager                        |
-| `balance.updated`   | `{ employeeId, locationId, leaveType, available }` | Affected employee             |
-| `hcm.sync.completed`| `{ syncType, status, updatedCount }`             | Admin room                     |
+| Event                    | Payload                                                               | Recipients                          |
+|--------------------------|-----------------------------------------------------------------------|-------------------------------------|
+| `request.created`        | `{ requestId, employeeId, daysCount, leaveType, startDate, endDate }` | Manager (personal room) + all managers room |
+| `request.approved`       | `{ requestId, status, managerNote }`                                  | Requesting employee + all managers  |
+| `request.rejected`       | `{ requestId, status, managerNote }`                                  | Requesting employee + all managers  |
+| `request.cancelled`      | `{ requestId }`                                                       | Manager (personal room)             |
+| `balance.updated`        | `{ employeeId, locationId, leaveType, available, totalDays, usedDays, pendingDays }` | Affected employee |
+| `balance.overdrawn-warning` | `{ employeeId, affectedRequests: string[] }`                       | All admins — fired when HCM webhook/batch lowers a balance below the sum of pending requests |
+| `hcm.sync.completed`     | `{ syncType, updated, errors }`                                       | All admins — fired after batch reconciliation |
 
 ---
 
@@ -374,10 +397,10 @@ All WebSocket events are room-scoped (each authenticated user joins their own `u
 
 **Problem**: HCM can update balances (anniversaries, HR corrections) at any time without notifying ExampleHR.
 
-**Chosen Solution**: Three-layer sync — webhook (real-time push), cron reconciliation (daily batch), and real-time pre-flight check before approval.
+**Chosen Solution**: Pull-on-read with push fallback. Every balance read fetches live from HCM and refreshes the local cache (`totalDays = hcm.balance + usedDays`). HCM also pushes HMAC-signed webhooks for autonomous changes (anniversary bonuses, year-resets). An admin-triggered batch endpoint covers bulk reconciliation.
 
 **Alternatives Considered**:
-- *Always query HCM live (no local cache)*: Rejected — creates HCM as single point of failure; any HCM outage blocks all requests.
+- *Local cache as primary, periodic sync only*: Rejected — cache can be stale between sync runs; employees could see and act on incorrect balances.
 - *Queue-based sync (Redis/RabbitMQ)*: Rejected — adds infrastructure complexity; overkill for SQLite-based deployment.
 
 ### Challenge 2: Concurrent Approval Race Condition
@@ -394,17 +417,17 @@ All WebSocket events are room-scoped (each authenticated user joins their own `u
 
 **Problem**: HCM real-time API may not always return errors for insufficient balance, and may be temporarily down.
 
-**Chosen Solution**: Local balance validation as a mandatory fallback regardless of HCM response. HCM check is "advisory + sync" rather than the only gate.
+**Chosen Solution**: HCM is primary but never a single point of failure. If `GET /hcm/balance` times out or errors, the service silently falls back to the last local cached balance and logs a warning. The local cache is kept fresh by the pull-on-read strategy so fallback values are rarely stale. At submission, `hcm.balance - pendingDays` is evaluated; if HCM is down, `totalDays - usedDays - pendingDays` is used. At approval, HCM is always checked; if it reports insufficient balance the request is auto-rejected with a clear note.
 
 **Alternatives Considered**:
-- *Block requests entirely when HCM is down*: Rejected — poor UX, legitimate requests blocked.
+- *Block requests entirely when HCM is down*: Rejected — poor UX; legitimate requests blocked unnecessarily.
 - *Queue requests for deferred HCM validation*: Considered for future iteration; out of scope for v1.
 
 ### Challenge 4: Duplicate Request Submission
 
-**Problem**: Network retries or double-clicks could create duplicate requests.
+**Problem**: Network retries or double-clicks could create duplicate requests. A UNIQUE DB-level constraint would also prevent re-submission after a REJECTED or CANCELLED request for the same dates.
 
-**Chosen Solution**: Idempotency key = SHA-256(`employeeId:startDate:endDate:leaveType`) stored as UNIQUE constraint. Duplicate submission returns 409 with the original request ID.
+**Chosen Solution**: Idempotency key = SHA-256(`employeeId:startDate:endDate:leaveType`) stored with an index (not a UNIQUE constraint). The application layer checks for an existing record with the same key **and status IN (PENDING, APPROVED)** only. A re-submit after REJECTED/CANCELLED is allowed and creates a new record.
 
 **Note**: We only apply idempotency to request creation (the most critical duplication risk), not to all endpoints.
 
